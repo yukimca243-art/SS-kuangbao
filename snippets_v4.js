@@ -61,53 +61,62 @@ const decodeBase64 = (str) => {
   }
 };
 
-// ============ UUID 验证（位运算合并比较） ============
-const verifyUUID = (data) => (
-  ((data[1] ^ UUID[0]) | (data[2] ^ UUID[1]) | (data[3] ^ UUID[2]) | (data[4] ^ UUID[3]) |
-   (data[5] ^ UUID[4]) | (data[6] ^ UUID[5]) | (data[7] ^ UUID[6]) | (data[8] ^ UUID[7]) |
-   (data[9] ^ UUID[8]) | (data[10] ^ UUID[9]) | (data[11] ^ UUID[10]) | (data[12] ^ UUID[11]) |
-   (data[13] ^ UUID[12]) | (data[14] ^ UUID[13]) | (data[15] ^ UUID[14]) | (data[16] ^ UUID[15])) === 0
-);
+// ============ UUID 验证（SIMD风格位运算优化） ============
+const verifyUUID = (data, offset) => {
+  // 4字节块并行比较，早期失败
+  return (
+    ((data[offset] ^ UUID[0]) | (data[offset + 1] ^ UUID[1]) |
+     (data[offset + 2] ^ UUID[2]) | (data[offset + 3] ^ UUID[3])) === 0 &&
+    ((data[offset + 4] ^ UUID[4]) | (data[offset + 5] ^ UUID[5]) |
+     (data[offset + 6] ^ UUID[6]) | (data[offset + 7] ^ UUID[7])) === 0 &&
+    ((data[offset + 8] ^ UUID[8]) | (data[offset + 9] ^ UUID[9]) |
+     (data[offset + 10] ^ UUID[10]) | (data[offset + 11] ^ UUID[11])) === 0 &&
+    ((data[offset + 12] ^ UUID[12]) | (data[offset + 13] ^ UUID[13]) |
+     (data[offset + 14] ^ UUID[14]) | (data[offset + 15] ^ UUID[15])) === 0
+  );
+};
 
-// ============ 地址解析 ============
-const parseAddress = (data, offset) => {
-  const atype = data[offset + 3];
-  const base = offset + 4;
-  const dataLen = data.length;
+// ============ 标准VLESS地址解析（优化版） ============
+const parseAddress = (data, offset, dataLen) => {
+  const atype = data[offset];
 
-  if (atype === ATYPE_DOMAIN) {
-    const domainLen = data[base];
-    const end = base + 1 + domainLen;
-    if (end > dataLen) return PARSE_FAIL;
-    return createParseResult(
-      textDecoder.decode(data.subarray(base + 1, end)),
-      end,
-      true
-    );
-  }
-
+  // IPv4 - 最常见，优先处理
   if (atype === ATYPE_IPV4) {
-    const end = base + 4;
+    const end = offset + 5;
     if (end > dataLen) return PARSE_FAIL;
+    const d = data;
+    const o = offset + 1;
     return createParseResult(
-      `${data[base]}.${data[base + 1]}.${data[base + 2]}.${data[base + 3]}`,
+      `${d[o]}.${d[o + 1]}.${d[o + 2]}.${d[o + 3]}`,
       end,
       true
     );
   }
 
-  if (atype === ATYPE_IPV6) {
-    const end = base + 16;
+  // 域名 - 次常见
+  if (atype === ATYPE_DOMAIN) {
+    if (offset + 2 > dataLen) return PARSE_FAIL;
+    const domainLen = data[offset + 1];
+    const end = offset + 2 + domainLen;
     if (end > dataLen) return PARSE_FAIL;
-    const dv = new DataView(data.buffer, data.byteOffset + base, 16);
     return createParseResult(
-      `${dv.getUint16(0).toString(16)}:${dv.getUint16(2).toString(16)}:` +
-      `${dv.getUint16(4).toString(16)}:${dv.getUint16(6).toString(16)}:` +
-      `${dv.getUint16(8).toString(16)}:${dv.getUint16(10).toString(16)}:` +
-      `${dv.getUint16(12).toString(16)}:${dv.getUint16(14).toString(16)}`,
+      textDecoder.decode(data.subarray(offset + 2, end)),
       end,
       true
     );
+  }
+
+  // IPv6 - 较少使用
+  if (atype === ATYPE_IPV6) {
+    const end = offset + 17;
+    if (end > dataLen) return PARSE_FAIL;
+    const dv = new DataView(data.buffer, data.byteOffset + offset + 1, 16);
+    // 使用数组join减少字符串拼接
+    const parts = new Array(8);
+    for (let i = 0; i < 8; i++) {
+      parts[i] = dv.getUint16(i * 2).toString(16);
+    }
+    return createParseResult(parts.join(':'), end, true);
   }
 
   return PARSE_FAIL;
@@ -153,9 +162,13 @@ class State {
   }
 }
 
-// ============ 首帧构建 ============
+// ============ VLESS响应头（预分配） ============
+const VLESS_RESPONSE_HEADER = new Uint8Array([0x00, 0x00]); // 版本0 + 无附加信息
+
+// ============ 首帧构建（标准VLESS响应） ============
 const buildFirstFrame = (chunk) => {
-  const frame = new Uint8Array(chunk.length + 2);
+  const frame = new Uint8Array(2 + chunk.length);
+  frame.set(VLESS_RESPONSE_HEADER, 0);
   frame.set(chunk, 2);
   return frame;
 };
@@ -206,6 +219,43 @@ const createDownlink = (state, ws, readable) => {
   })();
 };
 
+// ============ 标准VLESS协议解析（优化版） ============
+const parseVLESSRequest = (data) => {
+  const dataLen = data.length;
+
+  // 快速失败：最小长度检查（版本1 + UUID16 + 附加长度1 + 指令1 + 端口2 + 地址类型1）
+  if (dataLen < 22 || data[0] !== 0x00) return null;
+
+  // UUID验证（早期失败）
+  if (!verifyUUID(data, 1)) return null;
+
+  // 计算指令偏移（附加信息长度在偏移17）
+  const addonsLen = data[17];
+  const cmdOffset = 18 + addonsLen;
+
+  // 边界检查 + 指令验证（合并）
+  if (cmdOffset + 3 > dataLen) return null;
+  const cmd = data[cmdOffset];
+  if ((cmd & 0xFE) !== 0) return null; // 快速检查：只允许0x01或0x02
+
+  // 使用位运算读取端口（避免多次数组访问）
+  const port = (data[cmdOffset + 1] << 8) | data[cmdOffset + 2];
+
+  // 地址解析（传入dataLen避免重复访问）
+  const addrOffset = cmdOffset + 3;
+  if (addrOffset >= dataLen) return null;
+
+  const addr = parseAddress(data, addrOffset, dataLen);
+  if (!addr.ok) return null;
+
+  return {
+    cmd,
+    port,
+    host: addr.host,
+    dataOffset: addr.end
+  };
+};
+
 // ============ 主处理器 ============
 export default {
   async fetch(req) {
@@ -217,28 +267,23 @@ export default {
 
     // 解码 payload
     const decoded = decodeBase64(protocol);
-    if (!decoded.ok || decoded.data.length < 18) return RESP_400();
+    if (!decoded.ok) return RESP_400();
     const data = decoded.data;
 
-    // UUID 验证
-    if (!verifyUUID(data)) return RESP_403();
+    // 标准VLESS协议解析
+    const vlessReq = parseVLESSRequest(data);
+    if (!vlessReq) return RESP_403();
 
-    // 地址偏移与端口
-    const addrOffset = 18 + data[17];
-    if (addrOffset + 4 > data.length) return RESP_400();
-    const port = (data[addrOffset + 1] << 8) | data[addrOffset + 2];
-
-    // 解析地址
-    const addr = parseAddress(data, addrOffset);
-    if (!addr.ok) return RESP_400();
+    // 仅支持TCP指令
+    if (vlessReq.cmd !== 0x01) return RESP_400();
 
     // TCP 连接（回退机制）
     let tcp;
     try {
-      tcp = await connectTCP(addr.host, port, false);
+      tcp = await connectTCP(vlessReq.host, vlessReq.port, false);
     } catch {
       try {
-        tcp = await connectTCP(addr.host, port, true);
+        tcp = await connectTCP(vlessReq.host, vlessReq.port, true);
       } catch {
         return RESP_502();
       }
@@ -252,8 +297,8 @@ export default {
     const state = new State();
     state.init(server, tcp);
 
-    // 初始数据
-    const initial = data.length > addr.end ? data.subarray(addr.end) : EMPTY_BYTES;
+    // 初始数据（VLESS协议头之后的数据）
+    const initial = data.length > vlessReq.dataOffset ? data.subarray(vlessReq.dataOffset) : EMPTY_BYTES;
 
     // 建立管道
     const onMessage = createUplink(state, initial, tcp.writable);
